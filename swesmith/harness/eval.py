@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import threading
+from pathlib import Path
 
 from datasets import load_dataset
 from swebench.harness.constants import (
@@ -40,6 +41,9 @@ def run_evaluation(
     run_id: str,
     f2p_only: bool = False,
     is_gold: bool = False,
+    backend: str = "docker",
+    sif: Path | None = None,
+    work_dir: Path | None = None,
 ) -> dict:
     """
     Run per-prediction evaluation
@@ -50,17 +54,36 @@ def run_evaluation(
         resolved: bool indicating if the instance was resolved
     """
     instance_id = pred[KEY_INSTANCE_ID]
-    rp = registry.get_from_inst(instance)
-    logger, timed_out = run_patch_in_container(  # type: ignore
-        instance,
-        run_id,
-        RUN_EVALUATION_LOG_DIR,
-        rp.timeout,
-        patch=pred[KEY_PREDICTION],
-        commit=instance_id,
-        f2p_only=f2p_only,
-        is_gold=is_gold,
-    )
+    if backend == "apptainer":
+        from swesmith.harness.apptainer import run_patch
+
+        if any(not part or Path(part).name != part or part in (".", "..") for part in (run_id, instance_id)):
+            raise ValueError("Apptainer evaluation requires a run name and an instance ID without path components")
+        directory = RUN_EVALUATION_LOG_DIR / run_id / instance_id
+        # A failed redo must not grade a previous attempt's output or resume its report.
+        for filename in (LOG_REPORT, LOG_TEST_OUTPUT):
+            (directory / filename).unlink(missing_ok=True)
+        try:
+            rp = registry.get_from_inst(instance)
+            logger, timed_out = run_patch(instance, rp, pred[KEY_PREDICTION], directory, sif, work_dir,
+                                          is_gold=is_gold, f2p_only=f2p_only)
+        except Exception as exc:
+            print(f"Could not prepare Apptainer evaluation for {instance_id}: {exc}")
+            return {"status": "error", "resolved": False}
+    elif backend == "docker":
+        rp = registry.get_from_inst(instance)
+        logger, timed_out = run_patch_in_container(  # type: ignore
+            instance,
+            run_id,
+            RUN_EVALUATION_LOG_DIR,
+            rp.timeout,
+            patch=pred[KEY_PREDICTION],
+            commit=instance_id,
+            f2p_only=f2p_only,
+            is_gold=is_gold,
+        )
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
 
     eval_folder = RUN_EVALUATION_LOG_DIR / run_id
     report_path = eval_folder / instance_id / LOG_REPORT
@@ -103,6 +126,9 @@ def main(
     instance_ids: list | None = None,
     report_only: bool = False,
     redo_existing: bool = False,
+    backend: str = "docker",
+    sif: Path | None = None,
+    work_dir: Path | None = None,
 ):
     """
     Run evaluation of predictions on SWE-smith style dataset.
@@ -119,6 +145,9 @@ def main(
         redo_existing: Redo completed evaluation instances
     """
     assert len(run_id) > 0, "Run ID must be provided"
+
+    if backend == "apptainer" and not report_only and (sif is None or work_dir is None):
+        raise ValueError("Apptainer evaluation requires --sif and --work-dir")
 
     # Get dataset
     if dataset_path.endswith(".json"):
@@ -194,6 +223,9 @@ def main(
                 run_id,
                 f2p_only,
                 is_gold,
+                backend,
+                sif,
+                work_dir,
             )
         )
 
@@ -294,5 +326,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--report_only", action="store_true", help="Regenerate reports only"
     )
+    parser.add_argument("--backend", choices=("docker", "apptainer"), default="docker")
+    parser.add_argument("--sif", type=Path, help="Local SIF matching the selected task")
+    parser.add_argument("--work-dir", type=Path, help="Root for fresh evaluation workspaces")
     args = parser.parse_args()
     main(**vars(args))
